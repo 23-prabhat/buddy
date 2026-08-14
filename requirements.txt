@@ -1,0 +1,9 @@
+# Convenience pin file for contributors who prefer pip -r
+# Canonical deps live in pyproject.toml — prefer:
+#   pip install -e ".[dev]"
+#   uv pip install -e ".[dev]"
+
+-e .
+pytest>=8.3.0
+pytest-asyncio>=0.25.0
+ruff>=0.9.0
