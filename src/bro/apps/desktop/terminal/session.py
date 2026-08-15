@@ -6,9 +6,6 @@ from typing import Any
 
 from bro.ai.providers.base import AIProvider
 from bro.ai.providers.factory import create_ai_provider
-from bro.audio.capture.microphone import MicrophoneAudioSource
-from bro.audio.stt.factory import create_stt_provider
-from bro.audio.vad.energy import EnergyVAD
 from bro.core.commands.handlers import make_assistant_context
 from bro.core.commands.registry import CommandRegistry
 from bro.core.configuration.settings import Settings, get_settings
@@ -16,10 +13,8 @@ from bro.core.context.engine import ContextEngine
 from bro.core.conversation.memory import ConversationMemory
 from bro.core.conversation.transcript import RollingTranscript
 from bro.core.events.bus import EventBus
-from bro.core.meeting.engine import MeetingEngine
 from bro.osplat.screen_capture import get_platform_service
 from bro.rag.retrieval.store import VectorStore
-from bro.tts.providers.factory import create_tts_provider
 from bro.vision.ocr.tesseract import TesseractOcrProvider
 from bro.vision.pipeline import ScreenPipeline
 
@@ -45,20 +40,18 @@ class TerminalSession:
         self.events = EventBus()
         self.context_engine = ContextEngine(self.settings)
         self.provider: AIProvider = create_ai_provider(self.settings)
-        self.stt = create_stt_provider(self.settings)
-        self.tts = create_tts_provider(self.settings)
         self.mode = self.settings.mode
         self.busy = False
-        self.mic_on = False
         self.meeting_on = False
         self.screen_active = False
         self.screen_text = ""
         self.screen_description = ""
         self.last_screen_summary = ""
+        self.last_response = ""
         self.transcript = RollingTranscript(window_seconds=self.settings.meeting_context_seconds)
         self.rag = VectorStore()
-        self._meeting: MeetingEngine | None = None
-        self._listen_task: asyncio.Task | None = None
+        self._pending_screenshot: Any = None  # Screenshot set by UI for region select
+        self._pending_region: tuple[int, int, int, int] | None = None
 
         self._platform = get_platform_service()
         self._ocr = TesseractOcrProvider(lang=self.settings.ocr_lang)
@@ -101,9 +94,8 @@ class TerminalSession:
         self._on_exit()
 
     async def _shutdown(self) -> None:
-        await self.run_listen_stop()
+        self.meeting_on = False
         await self.run_meeting_stop()
-        self.stop_tts()
 
     def get_settings_public(self) -> dict[str, Any]:
         return self.settings.public_dict()
@@ -116,8 +108,6 @@ class TerminalSession:
             f"mode={self.mode}",
             f"provider={self.provider.name}",
             f"model={self.settings.ai_model}",
-            f"stt={self.stt.name}",
-            f"tts={self.tts.name}",
             f"history_messages={len(self.memory.history())}",
             f"meeting_lines={len(self.transcript)}",
             f"screen_text_chars={len(self.screen_text)}",
@@ -148,17 +138,11 @@ class TerminalSession:
         return (
             f"[MODEL] mode={info['key_mode']} provider={info['provider']} "
             f"model={info['model']} base={info['base_url']} "
-            f"key={info['api_key_preview']} stt={self.stt.name} tts={self.tts.name}"
+            f"key={info['api_key_preview']}"
         )
 
     def clear_history(self) -> None:
         self.memory.clear()
-
-    def stop_tts(self) -> None:
-        try:
-            self.tts.stop()
-        except Exception:  # noqa: BLE001
-            pass
 
     def _persist_and_reload(self, updates: dict[str, str]) -> None:
         from bro.core.configuration.envfile import upsert_env_values
@@ -364,18 +348,17 @@ class TerminalSession:
             self._on_stream_end()
         answer = "".join(parts).strip()
         if answer:
+            self.last_response = answer
             self.memory.add("assistant", answer)
             await self.events.emit("answer", text=answer)
-            if self.settings.voice_output_enabled:
-                self.write_system("[VOICE] Speaking...")
-                try:
-                    await self.tts.speak(answer)
-                except Exception as exc:  # noqa: BLE001
-                    self.write_line(f"[WARN] TTS failed: {exc}", "warn")
         else:
             self.write_line("[WARN] Empty response from provider.", "warn")
 
-    async def run_screen_read(self, monitor: int | None = None) -> None:
+    async def run_screen_read(
+        self,
+        monitor: int | None = None,
+        region: tuple[int, int, int, int] | None = None,
+    ) -> None:
         if not self.settings.screen_capture_enabled:
             self.write_line(
                 "[ERROR] Screen capture disabled. Set SCREEN_CAPTURE_ENABLED=true in .env",
@@ -391,7 +374,9 @@ class TerminalSession:
         self._on_status()
         try:
             self.write_system("[SCREEN] Capturing...")
-            result = await self._screen.understand(monitor=mon, question=None, use_vision=False)
+            result = await self._screen.understand(
+                monitor=mon, question=None, use_vision=False, region=region
+            )
             self.screen_text = result.ocr.text
             self.screen_description = result.description
             self.last_screen_summary = result.source_summary
@@ -419,7 +404,12 @@ class TerminalSession:
             self.screen_active = False
             self._on_status()
 
-    async def run_screen_analyze(self, question: str, monitor: int | None = None) -> None:
+    async def run_screen_analyze(
+        self,
+        question: str,
+        monitor: int | None = None,
+        region: tuple[int, int, int, int] | None = None,
+    ) -> None:
         if not self.settings.screen_capture_enabled:
             self.write_line(
                 "[ERROR] Screen capture disabled. Set SCREEN_CAPTURE_ENABLED=true in .env",
@@ -435,10 +425,14 @@ class TerminalSession:
         self._on_status()
         try:
             self.write_system("[SCREEN] Capturing...")
+            screenshot = self._pending_screenshot
+            reg = region or self._pending_region
             result = await self._screen.understand(
                 monitor=mon,
                 question=question or "Explain what is on this screen.",
                 use_vision=True,
+                region=reg,
+                screenshot=screenshot,
             )
             self.screen_text = result.ocr.text
             self.screen_description = result.description
@@ -467,153 +461,80 @@ class TerminalSession:
         except Exception as exc:  # noqa: BLE001
             self.write_line(f"[ERROR] Screen analyze failed: {exc}", "error")
         finally:
+            self._pending_screenshot = None
+            self._pending_region = None
             self.busy = False
             self.screen_active = False
             self._on_status()
 
-    async def run_listen_start(self) -> None:
-        if self.mic_on or self.meeting_on:
-            self.write_line("[WARN] Mic already in use (listen or meeting).", "warn")
-            return
-        self.mic_on = True
-        self._on_status()
-        self.write_system("[LISTEN] Speak now… (auto-stops after silence)")
-        device = self.settings.audio_device or None
-        source = MicrophoneAudioSource(
-            sample_rate=self.settings.audio_sample_rate,
-            device=device if device else None,
-        )
-        vad = EnergyVAD(sample_rate=self.settings.audio_sample_rate)
-        try:
-            await source.start()
-            async for chunk in source.read():
-                if not self.mic_on:
-                    break
-                _sp, utt = vad.process(chunk.pcm)
-                if utt:
-                    await source.stop()
-                    self.write_system("[STT] Transcribing...")
-                    seg = await self.stt.transcribe(utt, sample_rate=chunk.sample_rate)
-                    text = (seg.text or "").strip()
-                    if text:
-                        self.write_line(f'You: "{text}"', "info")
-                        await self.run_ask(text, speaker="User")
-                    else:
-                        self.write_line("[WARN] Empty transcription.", "warn")
-                    break
-            else:
-                leftover = vad.flush()
-                await source.stop()
-                if leftover:
-                    seg = await self.stt.transcribe(leftover, sample_rate=self.settings.audio_sample_rate)
-                    text = (seg.text or "").strip()
-                    if text:
-                        self.write_line(f'You: "{text}"', "info")
-                        await self.run_ask(text, speaker="User")
-        except Exception as exc:  # noqa: BLE001
-            self.write_line(f"[ERROR] Listen failed: {exc}", "error")
+    async def run_screen_select(self, question: str = "") -> None:
+        """Analyze a user-selected screen region.
+
+        The UI layer captures a full screenshot, shows a region selector, then
+        stashes the result in ``_pending_screenshot`` / ``_pending_region`` and
+        dispatches here. Falls back to a prompt if the UI didn't preselect.
+        """
+        if not self.settings.screen_capture_enabled:
             self.write_line(
-                "[INFO] Install: uv pip install numpy sounddevice. Check mic permissions.",
+                "[ERROR] Screen capture disabled. Set SCREEN_CAPTURE_ENABLED=true in .env",
+                "error",
+            )
+            return
+        if self._pending_screenshot is None and self._pending_region is None:
+            self.write_line(
+                "[HINT] Region selection needs the desktop UI. "
+                'Use: screen select "question"  (drag a rectangle on screen)',
                 "muted",
             )
-        finally:
-            try:
-                await source.stop()
-            except Exception:  # noqa: BLE001
-                pass
-            self.mic_on = False
-            self._on_status()
-
-    async def run_listen_stop(self) -> None:
-        self.mic_on = False
-        self.write_system("[LISTEN] Stopped.")
-        self._on_status()
+            return
+        await self.run_screen_analyze(question)
 
     async def run_meeting_start(self) -> None:
         if self.meeting_on:
             self.write_line("[WARN] Meeting already running.", "warn")
             return
-        if self.mic_on:
-            self.write_line("[WARN] Stop listen first.", "warn")
-            return
         if self.mode == "general":
             self.mode = "meeting"
-        device = self.settings.audio_device or None
-        source = MicrophoneAudioSource(
-            sample_rate=self.settings.audio_sample_rate,
-            device=device if device else None,
-        )
-
-        async def on_q(question: str, speaker: str) -> None:
-            if self.busy:
-                return
-            self.busy = True
-            self._on_status()
-            try:
-                await self._answer(question, speaker=speaker)
-            finally:
-                self.busy = False
-                self._on_status()
-
-        self._meeting = MeetingEngine(
-            audio=source,
-            stt=self.stt,
-            transcript=self.transcript,
-            on_line=self.write_line,
-            on_question=on_q if self.settings.meeting_auto_answer else None,
-            auto_answer=self.settings.meeting_auto_answer,
-            audio_source_label="microphone",
-        )
-        try:
-            await self._meeting.start()
-        except Exception as exc:  # noqa: BLE001
-            self.write_line(f"[ERROR] Meeting start failed: {exc}", "error")
-            self._meeting = None
-            return
         self.meeting_on = True
-        self.mic_on = True
-        self.write_system("[MEETING] Started")
-        self.write_system(f"[AUDIO] Listening… STT={self.stt.name}")
+        self.write_system("[MEETING] Started (text-only mode)")
+        self.write_system(
+            "[INFO] Audio transcription removed. Paste lines with: "
+            'meeting inject "what was said"'
+        )
         self.write_system(f"[CONTEXT] Rolling window: {self.settings.meeting_context_seconds}s")
         self._on_status()
 
     async def run_meeting_stop(self) -> None:
-        if self._meeting:
-            await self._meeting.stop()
-            self._meeting = None
         self.meeting_on = False
-        self.mic_on = False
         self.write_system("[MEETING] Stopped")
         self._on_status()
 
     def run_meeting_status(self) -> None:
-        if self._meeting:
-            st = self._meeting.status()
-            self.write_system(
-                f"[MEETING] running={st.running} lines={st.lines} stt={st.stt}"
-            )
-            if st.last_text:
-                self.write_line(f'last: "{st.last_text}"', "muted")
-        else:
-            self.write_system("[MEETING] not running")
+        state = "running" if self.meeting_on else "stopped"
+        self.write_system(f"[MEETING] {state} · lines={len(self.transcript)}")
         mt = self.transcript.format_text()
         if mt:
             self.write_line(mt[-1200:], "muted")
+        else:
+            self.write_line("  (no transcript yet — use: meeting inject \"text\")", "muted")
 
     async def inject_meeting_text(self, text: str) -> None:
-        """Dev/test: inject transcript without mic."""
-        if not self._meeting:
-            # lightweight path without full engine
-            self.transcript.add("Speaker A", text, source="inject")
-            self.write_line(f'Speaker A: "{text}"', "info")
-            from bro.ai.reasoning.question_detect import QuestionDetector
+        """Push a transcript line as if spoken, then run question detection."""
+        self.transcript.add("Speaker A", text, source="inject")
+        self.write_line(f'Speaker A: "{text}"', "info")
+        from bro.ai.reasoning.question_detect import QuestionDetector
 
-            det = QuestionDetector().detect(text, speaker="Speaker A")
-            if det.is_question and det.directed_at_user:
-                self.write_system(f"[QUESTION] Detected (conf={det.confidence:.2f})")
-                await self.run_ask(det.normalized, speaker="Speaker A")
-            return
-        await self._meeting.inject_text(text, speaker="Speaker A")
+        det = QuestionDetector().detect(text, speaker="Speaker A")
+        if det.is_question and det.directed_at_user:
+            self.write_system(f"[QUESTION] Detected (conf={det.confidence:.2f}) · {det.reason}")
+            if self.settings.meeting_auto_answer and not self.busy:
+                self.busy = True
+                self._on_status()
+                try:
+                    await self._answer(det.normalized, speaker="Speaker A")
+                finally:
+                    self.busy = False
+                    self._on_status()
 
     async def run_rag_add(self, path: str) -> None:
         try:
@@ -643,8 +564,7 @@ class TerminalSession:
             "READY" if self.settings.screen_capture_enabled else "OFF"
         )
         return {
-            "MIC": "ON" if self.mic_on else "OFF",
-            "AUDIO": "ON" if self.meeting_on else "OFF",
+            "MEETING": "ON" if self.meeting_on else "OFF",
             "SCREEN": screen,
             "AI": ai,
             "MODE": self.mode,
@@ -652,6 +572,4 @@ class TerminalSession:
 
     def reload_provider(self) -> None:
         self.provider = create_ai_provider(self.settings)
-        self.stt = create_stt_provider(self.settings)
-        self.tts = create_tts_provider(self.settings)
         self._screen.ai = self.provider

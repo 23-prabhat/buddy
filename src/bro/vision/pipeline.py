@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from bro.ai.providers.base import AIProvider
 from bro.osplat.base import PlatformService, Screenshot
+from bro.osplat.screen_capture import crop_screenshot
 from bro.vision.ocr.base import OcrProvider, OcrResult
 
 
@@ -17,7 +18,13 @@ class ScreenUnderstanding:
 
 
 class ScreenPipeline:
-    """Capture → OCR → optional multimodal vision."""
+    """Capture -> OCR -> optional multimodal vision.
+
+    Supports three capture modes:
+      * whole monitor         (monitor=...)
+      * live screen region    (region=(x,y,w,h) in screen coords)
+      * pre-captured image    (screenshot=...), optionally cropped to region
+    """
 
     def __init__(
         self,
@@ -39,8 +46,22 @@ class ScreenPipeline:
         monitor: int = 0,
         question: str | None = None,
         use_vision: bool | None = None,
+        region: tuple[int, int, int, int] | None = None,
+        screenshot: Screenshot | None = None,
     ) -> ScreenUnderstanding:
-        shot = self.capture(monitor=monitor)
+        # Decide the source screenshot.
+        if screenshot is not None:
+            shot = (
+                crop_screenshot(screenshot, *region)
+                if region is not None
+                else screenshot
+            )
+        elif region is not None:
+            x, y, w, h = region
+            shot = self.platform.capture_region(x, y, w, h)
+        else:
+            shot = self.capture(monitor=monitor)
+
         ocr = self.ocr.extract(shot.png_bytes)
         description = ""
         used_vision = False
@@ -71,9 +92,14 @@ class ScreenPipeline:
             else:
                 description = "OCR sufficient for text extraction."
 
+        src = (
+            f"region={region[0]},{region[1]}+{region[2]}x{region[3]}"
+            if region is not None
+            else f"monitor={shot.monitor_index}"
+        )
         summary_bits = [
             f"{shot.width}x{shot.height}",
-            f"monitor={shot.monitor_index}",
+            src,
             f"ocr={ocr.engine}" + (" ok" if ocr.useful else " weak/empty"),
             f"vision={'yes' if used_vision else 'no'}",
         ]

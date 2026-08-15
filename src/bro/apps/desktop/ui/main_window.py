@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import traceback
 
-from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
-from PySide6.QtGui import QAction, QFont, QKeyEvent, QTextCharFormat, QTextCursor, QColor, QIcon
+from PySide6.QtCore import Qt, QThread, QObject, QRect, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QFont, QKeyEvent, QPainter, QPixmap, QTextCharFormat, QTextCursor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QPlainTextEdit,
+    QRubberBand,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -35,6 +36,74 @@ class PromptLine(QLineEdit):
             return
         if event.key() == Qt.Key.Key_Down:
             self.history_down.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class RegionSelector(QWidget):
+    """Fullscreen overlay showing a frozen screenshot; user drags a rectangle.
+
+    Emits ``region_selected`` with screen-pixel coords (x, y, w, h) and ``cancelled``.
+    """
+
+    region_selected = Signal(int, int, int, int)
+    cancelled = Signal()
+
+    def __init__(self, screenshot_png: bytes, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._pixmap = QPixmap()
+        self._pixmap.loadFromData(screenshot_png)
+        self._origin = None
+        self._rubber: QRubberBand | None = None
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.drawPixmap(self.rect(), self._pixmap)
+        # Dim overlay so the selection stands out
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 110))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._origin = event.position().toPoint()
+        if self._rubber is None:
+            self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._rubber.setGeometry(QRect(self._origin, self._origin))
+        self._rubber.show()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._origin is None or self._rubber is None:
+            return
+        self._rubber.setGeometry(QRect(self._origin, event.position().toPoint()).normalized())
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton or self._origin is None:
+            return
+        rect = QRect(self._origin, event.position().toPoint()).normalized()
+        self._origin = None
+        if self._rubber:
+            self._rubber.hide()
+        if rect.width() < 8 or rect.height() < 8:
+            self.cancelled.emit()
+            self.close()
+            return
+        # Map widget coords to screen coords (fullscreen on primary screen).
+        top_left = self.mapToGlobal(rect.topLeft())
+        self.region_selected.emit(top_left.x(), top_left.y(), rect.width(), rect.height())
+        self.close()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            self.close()
             return
         super().keyPressEvent(event)
 
@@ -128,6 +197,9 @@ class MainWindow(QMainWindow):
         self._worker: AsyncWorker | None = None
         self._busy = False
         self._hotkeys = HotkeyManager()
+        self._hiding_for_capture = False
+        self._region_selector: RegionSelector | None = None
+        self._pending_select_line: str | None = None
 
         self.session = TerminalSession(
             registry=build_registry(),
@@ -199,11 +271,10 @@ class MainWindow(QMainWindow):
         ok = self._hotkeys.start(
             on_screen=lambda: fire("screen analyze"),
             on_meeting_toggle=lambda: fire("__toggle_meeting__"),
-            on_listen=lambda: fire("listen"),
         )
         if ok:
             self._append_styled(
-                "[HOTKEYS] Ctrl+Shift+S screen · Ctrl+Shift+M meeting · Ctrl+Shift+V listen",
+                "[HOTKEYS] Ctrl+Shift+S screen · Ctrl+Shift+M meeting",
                 "muted",
             )
         elif self._hotkeys.error:
@@ -248,6 +319,13 @@ class MainWindow(QMainWindow):
             asyncio.run(self.session.handle_line(line))
             self._refresh_status()
             return
+        screen_kind = self._screen_command_kind(line)
+        if screen_kind == "select":
+            self._begin_screen_select(line)
+            return
+        if screen_kind == "capture":
+            self._begin_hidden_capture(line)
+            return
         self._start_async_command(line)
 
     def _print_banner(self) -> None:
@@ -267,7 +345,7 @@ class MainWindow(QMainWindow):
         if self._busy and flags["AI"] == "READY":
             flags["AI"] = "BUSY"
         self.status.setText(
-            f"MIC: {flags['MIC']}   AUDIO: {flags['AUDIO']}   "
+            f"MEETING: {flags['MEETING']}   "
             f"SCREEN: {flags['SCREEN']}   AI: {flags['AI']}   MODE: {flags['MODE']}"
         )
         label = flags["AI"]
@@ -351,7 +429,6 @@ class MainWindow(QMainWindow):
             "exit",
             "quit",
             "q",
-            "stop",
             "rag",
             "apikey",
             "key",
@@ -372,7 +449,74 @@ class MainWindow(QMainWindow):
             self._refresh_status()
             return
 
+        # Screen commands get Gemini-style capture handling (hide app / region select)
+        screen_kind = self._screen_command_kind(text_strip)
+        if screen_kind == "select":
+            self._begin_screen_select(line)
+            return
+        if screen_kind == "capture":
+            self._begin_hidden_capture(line)
+            return
+
         self._start_async_command(line)
+
+    @staticmethod
+    def _screen_command_kind(text: str) -> str | None:
+        tokens = text.lstrip("$").strip().split()
+        if len(tokens) < 2 or tokens[0].lower() != "screen":
+            return None
+        sub = tokens[1].lower()
+        if sub in ("select", "region", "snip"):
+            return "select"
+        if sub in ("read", "analyze", "analyse"):
+            return "capture"
+        return None
+
+    def _begin_hidden_capture(self, line: str) -> None:
+        """Hide this window, let the OS repaint, then run the capture command."""
+        self._hiding_for_capture = True
+        self.hide()
+        QTimer.singleShot(350, lambda: self._start_async_command(line))
+
+    def _begin_screen_select(self, line: str) -> None:
+        """Capture a full screenshot (app hidden), show a region selector, then run."""
+        self._pending_select_line = line
+        self.hide()
+        QTimer.singleShot(350, self._capture_and_show_region_selector)
+
+    def _capture_and_show_region_selector(self) -> None:
+        try:
+            monitor = self.session.settings.screen_monitor
+            shot = self.session._platform.capture_screen(monitor=monitor)
+        except Exception as exc:  # noqa: BLE001
+            self.show()
+            self._append_styled(f"[ERROR] Screen capture failed: {exc}", "error")
+            return
+        self._region_selector = RegionSelector(shot.png_bytes)
+        self._region_selector.region_selected.connect(self._on_region_selected)
+        self._region_selector.cancelled.connect(self._on_region_cancelled)
+        # Keep the screenshot for cropping after the user selects.
+        self._select_screenshot = shot
+        self._region_selector.showFullScreen()
+
+    def _on_region_selected(self, x: int, y: int, w: int, h: int) -> None:
+        shot = getattr(self, "_select_screenshot", None)
+        self._region_selector = None
+        line = self._pending_select_line or "screen select"
+        self._pending_select_line = None
+        # Stash state for the session to consume (crop from the frozen shot).
+        self.session._pending_screenshot = shot
+        self.session._pending_region = (x, y, w, h)
+        self._hiding_for_capture = True  # stay hidden during analyze
+        self._start_async_command(line)
+
+    def _on_region_cancelled(self) -> None:
+        self._region_selector = None
+        self._pending_select_line = None
+        if hasattr(self, "_select_screenshot"):
+            del self._select_screenshot
+        self.show()
+        self._append_styled("[SCREEN] Region selection cancelled.", "muted")
 
     def _start_async_command(self, line: str) -> None:
         self._busy = True
@@ -407,6 +551,12 @@ class MainWindow(QMainWindow):
         self.prompt.setEnabled(True)
         self.prompt.setFocus()
         self._refresh_status()
+        if self._hiding_for_capture:
+            self._hiding_for_capture = False
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.prompt.setFocus()
 
     def _clear_worker(self) -> None:
         self._thread = None

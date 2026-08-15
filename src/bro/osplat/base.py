@@ -18,5 +18,9 @@ class PlatformService(ABC):
         """Capture a monitor. monitor=0 means primary / full virtual screen per impl."""
 
     @abstractmethod
+    def capture_region(self, x: int, y: int, width: int, height: int) -> Screenshot:
+        """Capture a rectangular region of the virtual desktop (screen coords)."""
+
+    @abstractmethod
     def list_monitors(self) -> list[dict]:
         """Return monitor metadata for selection."""

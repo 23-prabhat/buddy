@@ -27,7 +27,6 @@ class HotkeyManager:
         self,
         on_screen: Callable[[], None] | None = None,
         on_meeting_toggle: Callable[[], None] | None = None,
-        on_listen: Callable[[], None] | None = None,
     ) -> bool:
         try:
             from pynput import keyboard
@@ -39,7 +38,6 @@ class HotkeyManager:
         combos = {
             frozenset({keyboard.Key.ctrl, keyboard.Key.shift, keyboard.KeyCode.from_char("s")}): on_screen,
             frozenset({keyboard.Key.ctrl, keyboard.Key.shift, keyboard.KeyCode.from_char("m")}): on_meeting_toggle,
-            frozenset({keyboard.Key.ctrl, keyboard.Key.shift, keyboard.KeyCode.from_char("v")}): on_listen,
         }
         current: set = set()
 

@@ -15,8 +15,7 @@ class AppSession(Protocol):
     async def run_ask(self, question: str) -> None: ...
     async def run_screen_read(self, monitor: int | None = None) -> None: ...
     async def run_screen_analyze(self, question: str, monitor: int | None = None) -> None: ...
-    async def run_listen_start(self) -> None: ...
-    async def run_listen_stop(self) -> None: ...
+    async def run_screen_select(self, question: str = "") -> None: ...
     async def run_meeting_start(self) -> None: ...
     async def run_meeting_stop(self) -> None: ...
     def run_meeting_status(self) -> None: ...
@@ -30,7 +29,6 @@ class AppSession(Protocol):
     def get_mode(self) -> str: ...
     def get_model_info(self) -> str: ...
     def clear_history(self) -> None: ...
-    def stop_tts(self) -> None: ...
     def configure_apikey(self, args: list[str]) -> None: ...
     def configure_provider(self, args: list[str]) -> None: ...
     def list_providers(self) -> None: ...
@@ -45,16 +43,14 @@ async def cmd_help(cmd: ParsedCommand, session: AppSession) -> None:
         ("apikey free|own|set <key>|status|clear", "API key mode"),
         ("provider list|<name> [model]", "Select provider (openai/groq/gemini/…)"),
         ("model [name]", "Show or set model id"),
-        ("screen read|analyze|clear", "Screen capture / OCR / vision"),
-        ("listen [stop]", "One-shot voice question"),
-        ("meeting start|stop|status", "Meeting mode + question detect"),
+        ("screen read|analyze|select|clear", "Screen capture (full / region) + OCR / vision"),
+        ("meeting start|stop|status|inject", "Meeting mode (text-only: inject lines)"),
         ("rag add <path>|status|clear", "Personal knowledge base"),
         ("clear", "Clear the terminal view"),
         ("history", "Show conversation history"),
         ("context", "Show current context summary"),
         ("settings", "Show configuration (secrets redacted)"),
         ("mode [name]", "Get or set mode"),
-        ("stop", "Stop TTS playback"),
         ("exit / quit", "Leave the application"),
     ]
     for name, desc in lines:
@@ -83,7 +79,8 @@ async def cmd_provider(cmd: ParsedCommand, session: AppSession) -> None:
 async def cmd_screen(cmd: ParsedCommand, session: AppSession) -> None:
     if not cmd.args:
         session.write_line(
-            '[ERROR] Usage: screen read | screen analyze ["question"] | screen clear',
+            '[ERROR] Usage: screen read | screen analyze ["question"] | '
+            'screen select ["question"] | screen clear',
             "error",
         )
         return
@@ -96,6 +93,9 @@ async def cmd_screen(cmd: ParsedCommand, session: AppSession) -> None:
     if sub in ("analyze", "analyse"):
         await session.run_screen_analyze(question=" ".join(rest).strip())
         return
+    if sub in ("select", "region", "snip"):
+        await session.run_screen_select(question=" ".join(rest).strip())
+        return
     if sub == "clear":
         if hasattr(session, "screen_text"):
             session.screen_text = ""  # type: ignore[attr-defined]
@@ -103,14 +103,7 @@ async def cmd_screen(cmd: ParsedCommand, session: AppSession) -> None:
             session.last_screen_summary = ""  # type: ignore[attr-defined]
         session.write_system("[SCREEN] Context cleared.")
         return
-    session.write_line("[ERROR] Unknown screen subcommand. Use: read | analyze | clear", "error")
-
-
-async def cmd_listen(cmd: ParsedCommand, session: AppSession) -> None:
-    if cmd.args and cmd.args[0].lower() in ("stop", "off", "end"):
-        await session.run_listen_stop()
-        return
-    await session.run_listen_start()
+    session.write_line("[ERROR] Unknown screen subcommand. Use: read | analyze | select | clear", "error")
 
 
 async def cmd_meeting(cmd: ParsedCommand, session: AppSession) -> None:
@@ -200,11 +193,6 @@ async def cmd_mode(cmd: ParsedCommand, session: AppSession) -> None:
     session.write_system(f"[MODE] {mode}")
 
 
-async def cmd_stop(cmd: ParsedCommand, session: AppSession) -> None:
-    session.stop_tts()
-    session.write_system("[TTS] Stopped.")
-
-
 async def cmd_exit(cmd: ParsedCommand, session: AppSession) -> None:
     session.write_system("Goodbye.")
     session.request_exit()
@@ -217,7 +205,6 @@ def build_registry() -> CommandRegistry:
     reg.register("apikey", cmd_apikey, "API key mode", aliases=("key", "api-key"))
     reg.register("provider", cmd_provider, "Select AI provider", aliases=("providers",))
     reg.register("screen", cmd_screen, "Screen capture / analyze")
-    reg.register("listen", cmd_listen, "Voice listen")
     reg.register("meeting", cmd_meeting, "Meeting mode")
     reg.register("rag", cmd_rag, "Personal knowledge")
     reg.register("clear", cmd_clear, "Clear terminal")
@@ -226,7 +213,6 @@ def build_registry() -> CommandRegistry:
     reg.register("settings", cmd_settings, "Show settings")
     reg.register("model", cmd_model, "Show/set model")
     reg.register("mode", cmd_mode, "Get/set mode")
-    reg.register("stop", cmd_stop, "Stop TTS")
     reg.register("exit", cmd_exit, "Exit", aliases=("quit", "q"))
     reg.register("answer", cmd_ask, "Alias-style answer trigger")
     return reg

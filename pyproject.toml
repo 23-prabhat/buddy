@@ -16,7 +16,6 @@ keywords = [
   "meeting",
   "screen",
   "ocr",
-  "stt",
   "terminal",
   "pyside6",
   "fastapi",
@@ -50,8 +49,6 @@ dependencies = [
   "Pillow>=11.0.0",
   "pytesseract>=0.3.13",
   "mss>=9.0.2",
-  "numpy>=2.1.0",
-  "sounddevice>=0.5.1",
 ]
 
 [project.optional-dependencies]
@@ -62,8 +59,7 @@ dev = [
   "mypy>=1.14.0",
 ]
 hotkeys = ["pynput>=1.7.7"]
-stt-local = ["faster-whisper>=1.1.0"]
-all = ["bro[dev,hotkeys,stt-local]"]
+all = ["bro[dev,hotkeys]"]
 
 [project.urls]
 Homepage = "https://github.com/anomalyco/bro"

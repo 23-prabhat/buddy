@@ -45,6 +45,36 @@ class MssScreenCapture(PlatformService):
                 monitor_index=idx,
             )
 
+    def capture_region(self, x: int, y: int, width: int, height: int) -> Screenshot:
+        """Capture a rectangle of the virtual desktop in absolute screen coordinates."""
+        import mss
+        from PIL import Image
+
+        w = max(1, int(width))
+        h = max(1, int(height))
+        region = {"left": int(x), "top": int(y), "width": w, "height": h}
+        with mss.mss() as sct:
+            raw = sct.grab(region)
+            img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            return Screenshot(png_bytes=buf.getvalue(), width=img.width, height=img.height, monitor_index=-1)
+
+
+def crop_screenshot(shot: Screenshot, x: int, y: int, width: int, height: int) -> Screenshot:
+    """Crop an existing screenshot to a sub-rectangle (in that image's pixel coords)."""
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(shot.png_bytes))
+    w = max(1, min(int(width), img.width))
+    h = max(1, min(int(height), img.height))
+    left = max(0, int(x))
+    top = max(0, int(y))
+    crop = img.crop((left, top, left + w, top + h))
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG", optimize=True)
+    return Screenshot(png_bytes=buf.getvalue(), width=crop.width, height=crop.height, monitor_index=-1)
+
 
 def get_platform_service() -> PlatformService:
     _ = sys.platform

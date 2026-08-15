@@ -42,13 +42,6 @@ class Settings(BaseSettings):
     free_ai_provider: str = Field(default="groq", alias="FREE_AI_PROVIDER")
     free_ai_model: str = Field(default="llama-3.3-70b-versatile", alias="FREE_AI_MODEL")
 
-    stt_provider: str = Field(default="mock", alias="STT_PROVIDER")
-    stt_model: str = Field(default="whisper-1", alias="STT_MODEL")
-
-    tts_provider: str = Field(default="none", alias="TTS_PROVIDER")
-    tts_model: str = Field(default="", alias="TTS_MODEL")
-    voice_output_enabled: bool = Field(default=False, alias="VOICE_OUTPUT_ENABLED")
-
     meeting_context_seconds: int = Field(default=120, alias="MEETING_CONTEXT_SECONDS")
     meeting_auto_answer: bool = Field(default=True, alias="MEETING_AUTO_ANSWER")
 
@@ -56,9 +49,6 @@ class Settings(BaseSettings):
     screen_monitor: int = Field(default=1, alias="SCREEN_MONITOR")
     screen_force_vision: bool = Field(default=False, alias="SCREEN_FORCE_VISION")
     ocr_lang: str = Field(default="eng", alias="OCR_LANG")
-
-    audio_sample_rate: int = Field(default=16000, alias="AUDIO_SAMPLE_RATE")
-    audio_device: str = Field(default="", alias="AUDIO_DEVICE")
 
     hotkeys_enabled: bool = Field(default=True, alias="HOTKEYS_ENABLED")
     rag_enabled: bool = Field(default=True, alias="RAG_ENABLED")
@@ -79,17 +69,12 @@ class Settings(BaseSettings):
             "ai_base_url": ai["base_url"],
             "ai_api_key": ai["api_key"],
             "ai_api_key_preview": ai["api_key_preview"],
-            "stt_provider": self.stt_provider,
-            "stt_model": self.stt_model,
-            "tts_provider": self.tts_provider,
-            "voice_output_enabled": self.voice_output_enabled,
             "meeting_context_seconds": self.meeting_context_seconds,
             "meeting_auto_answer": self.meeting_auto_answer,
             "screen_capture_enabled": self.screen_capture_enabled,
             "screen_monitor": self.screen_monitor,
             "screen_force_vision": self.screen_force_vision,
             "ocr_lang": self.ocr_lang,
-            "audio_sample_rate": self.audio_sample_rate,
             "hotkeys_enabled": self.hotkeys_enabled,
             "rag_enabled": self.rag_enabled,
             "rag_path": self.rag_path or "(none)",
