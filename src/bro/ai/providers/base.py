@@ -9,6 +9,13 @@ from bro.core.context.engine import ContextPackage
 
 class AIProvider(ABC):
     name: str = "base"
+    # Model id currently configured for this provider, used by callers (e.g. the
+    # screen pipeline) to decide whether image input is permitted.
+    model: str = ""
+    # Whether ``analyze_screen`` can actually POST an image to the backend. Set
+    # by concrete providers from the catalog allowlist so the pipeline can warn
+    # the user and skip the image call instead of failing silently upstream.
+    supports_vision: bool = False
 
     @abstractmethod
     async def answer_stream(self, package: ContextPackage) -> AsyncIterator[str]:
@@ -26,4 +33,4 @@ class AIProvider(ABC):
         raise NotImplementedError("Screen analysis not implemented for this provider")
 
     def info(self) -> dict[str, Any]:
-        return {"name": self.name}
+        return {"name": self.name, "model": self.model, "supports_vision": self.supports_vision}

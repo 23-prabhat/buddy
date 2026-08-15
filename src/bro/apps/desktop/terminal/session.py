@@ -316,6 +316,8 @@ class TerminalSession:
                     self.screen_description = result.description
                     self.last_screen_summary = result.source_summary
                     self.write_system(f"[SCREEN] auto {result.source_summary}")
+                    if result.warning:
+                        self.write_line(result.warning, "warn")
                 except Exception as exc:  # noqa: BLE001
                     self.write_line(f"[WARN] Auto screen capture failed: {exc}", "warn")
 
@@ -381,6 +383,8 @@ class TerminalSession:
             self.screen_description = result.description
             self.last_screen_summary = result.source_summary
             self.write_system(f"[SCREEN] {result.source_summary}")
+            if result.warning:
+                self.write_line(result.warning, "warn")
             if result.ocr.error:
                 self.write_line(f"[OCR] {result.ocr.error}", "warn")
             if result.ocr.text:
@@ -427,10 +431,14 @@ class TerminalSession:
             self.write_system("[SCREEN] Capturing...")
             screenshot = self._pending_screenshot
             reg = region or self._pending_region
+            # use_vision=None lets the pipeline apply the OCR-first decision:
+            # skip the image call when OCR text alone answers the question, fall
+            # back to vision only when OCR is weak or the question mentions icons /
+            # charts / colors / diagrams. SCREEN_FORCE_VISION still overrides this.
             result = await self._screen.understand(
                 monitor=mon,
                 question=question or "Explain what is on this screen.",
-                use_vision=True,
+                use_vision=None,
                 region=reg,
                 screenshot=screenshot,
             )
@@ -438,6 +446,8 @@ class TerminalSession:
             self.screen_description = result.description
             self.last_screen_summary = result.source_summary
             self.write_system(f"[SCREEN] {result.source_summary}")
+            if result.warning:
+                self.write_line(result.warning, "warn")
             if result.ocr.error:
                 self.write_line(f"[OCR] {result.ocr.error}", "warn")
             if result.ocr.text:

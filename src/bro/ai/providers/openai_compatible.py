@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from openai import AsyncOpenAI
 
 from bro.ai.providers.base import AIProvider
+from bro.ai.providers.catalog import model_supports_vision
 from bro.core.context.engine import ContextPackage
 
 
@@ -31,8 +32,11 @@ class OpenAICompatibleProvider(AIProvider):
         self._base_url = base_url or ""
         if provider_label:
             self.name = provider_label
+            self.supports_vision = model_supports_vision(provider_label, model)
         else:
             self.name = "openai" if not base_url else "openai-compatible"
+            self.supports_vision = model_supports_vision(self.name, model)
+        self.model = model
 
     async def answer_stream(self, package: ContextPackage) -> AsyncIterator[str]:
         messages: list[dict] = [{"role": "system", "content": package.system_prompt}]

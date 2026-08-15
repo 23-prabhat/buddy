@@ -11,6 +11,8 @@ class MockAIProvider(AIProvider):
     """Offline provider for UI/dev without API keys."""
 
     name = "mock"
+    model = "mock"
+    supports_vision = False
 
     async def answer_stream(self, package: ContextPackage) -> AsyncIterator[str]:
         q = package.user_content.strip().splitlines()

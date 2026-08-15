@@ -3,16 +3,28 @@ from __future__ import annotations
 import asyncio
 import traceback
 
-from PySide6.QtCore import Qt, QThread, QObject, QRect, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QKeyEvent, QPainter, QPixmap, QTextCharFormat, QTextCursor, QIcon
+from PySide6.QtCore import QObject, QRect, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QIcon,
+    QKeyEvent,
+    QPainter,
+    QPixmap,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
     QPlainTextEdit,
+    QPushButton,
     QRubberBand,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -67,8 +79,10 @@ class RegionSelector(QWidget):
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.drawPixmap(self.rect(), self._pixmap)
-        # Dim overlay so the selection stands out
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 110))
+        # Dim the unselected area with a deep-plum wash so the magenta rubber
+        # band stands out against the retro-purple palette instead of dropping
+        # to near-black. ~55% translucent plum keeps the screenshot legible.
+        painter.fillRect(self.rect(), QColor(15, 10, 30, 140))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
@@ -161,7 +175,25 @@ class MainWindow(QMainWindow):
         self.ready = QLabel("● READY")
         self.ready.setObjectName("TitleBar")
         self.ready.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Mode-switch buttons (Chat / Screen / Meeting).Exclusive QButtonGroup
+        # keeps exactly one checked at a time; the active one is highlighted by
+        # QSS (#ModeButton:checked) so the user can see which mode is live.
+        self.mode_buttons: dict[str, QPushButton] = {}
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        for mode, label in (("general", "Chat"), ("screen", "Screen"), ("meeting", "Meeting")):
+            btn = QPushButton(label)
+            btn.setObjectName("ModeButton")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, m=mode: self._set_mode_button(m))
+            self._mode_group.addButton(btn)
+            self.mode_buttons[mode] = btn
+
         header.addWidget(self.title, 1)
+        for mode in ("general", "screen", "meeting"):
+            header.addWidget(self.mode_buttons[mode], 0)
         header.addWidget(self.ready, 0)
         header_w = QWidget()
         header_w.setLayout(header)
@@ -218,6 +250,7 @@ class MainWindow(QMainWindow):
 
         self._print_banner()
         self._refresh_status()
+        self._sync_mode_buttons(self.session.get_mode())
         self.prompt.setFocus()
 
     def _setup_tray(self) -> None:
@@ -329,15 +362,12 @@ class MainWindow(QMainWindow):
         self._start_async_command(line)
 
     def _print_banner(self) -> None:
-        self._append_styled("ai-assistant  ·  free Groq or your own API key", "system")
+        self._append_styled("Welcome to AI Assistant", "system")
         self._append_styled(
-            "apikey free | apikey set <key> | provider list | ask \"…\" | help",
+            "Pick a mode above (Chat / Screen / Meeting), then type a question "
+            "or 'help' for commands.",
             "muted",
         )
-        try:
-            self._append_styled(self.session.get_model_info(), "muted")
-        except Exception:  # noqa: BLE001
-            pass
         self._append_styled("", "info")
 
     def _refresh_status(self) -> None:
@@ -350,21 +380,85 @@ class MainWindow(QMainWindow):
         )
         label = flags["AI"]
         self.ready.setText(f"● {label}")
+        # Overlay-spinner purple when active, calm lavender-magenta when idle,
+        # so the LED matches the retro-purple palette instead of leftover warm
+        # amber/teal from the cream theme.
         if label in ("BUSY", "LISTENING"):
-            self.ready.setStyleSheet("color: #f0c674;")
+            self.ready.setStyleSheet("color: #e040fb;")
         else:
-            self.ready.setStyleSheet("color: #00ff9c;")
+            self.ready.setStyleSheet("color: #b388ff;")
+        # Keep the active mode button in sync with whatever last touched the
+        # session mode (a 'mode <name>' command, a meeting start/stop, hotkey…)
+        self._sync_mode_buttons(self.session.get_mode())
+
+    def _sync_mode_buttons(self, mode: str) -> None:
+        """Check the header button that matches the live session mode.
+
+        Modes outside the three buttons (coding / study / meeting+screen) are
+        projected onto their nearest button so something is always highlighted:
+          * meeting+screen -> Meeting (meeting active; screen is contextual)
+          * coding / study / general -> Chat
+        """
+        if mode == "meeting" or mode == "meeting+screen":
+            target = "meeting"
+        elif mode == "screen":
+            target = "screen"
+        else:
+            target = "general"
+        btn = self.mode_buttons.get(target)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+
+    def _set_mode_button(self, mode: str) -> None:
+        """Run when the user clicks Chat / Screen / Meeting in the title bar.
+
+        The buttons themselves are checkable, so a click both toggles the visual
+        state and lands here. We treat them as one-shot mode switches (not
+        toggles for the active mode): meeting button also starts/stops the live
+        meeting so the rest of the app (status, auto-answer, transcript) moves
+        with it instead of the mode flag drifting away from meeting_on.
+        """
+        if self._busy:
+            self._append_styled(
+                "[WARN] Wait for the current command to finish.", "warn"
+            )
+            # The click already flipped the checked state — restore it.
+            self._sync_mode_buttons(self.session.get_mode())
+            return
+
+        if mode == "meeting":
+            # Idempotent: clicking Meeting always lands in "meeting + live on",
+            # regardless of whether the live meeting was already running.
+            if not self.session.meeting_on:
+                asyncio.run(self.session.run_meeting_start())
+            # ``run_meeting_start`` only flips ``general -> meeting`` and keeps
+            # the current mode otherwise (so the legacy ``meeting start``
+            # command can build a ``meeting+screen`` combo). The header
+            # button is a clean three-way switch, so force the visible mode
+            # to "meeting" regardless of where we came from.
+            if self.session.get_mode() != "meeting":
+                self.session.set_mode("meeting")
+        else:
+            # Chat / Screen: leave any meeting so the status reflects reality
+            # before flipping the mode flag.
+            if self.session.meeting_on:
+                asyncio.run(self.session.run_meeting_stop())
+            self.session.set_mode(mode)
+            self._append_styled(f"[MODE] {mode}", "system")
+        self._refresh_status()
 
     def _color_for(self, style: str) -> QColor:
+        # Retro-purple palette: body on plum, accents in violet/magenta, with a
+        # warm amber for warnings so critical messages stay legible on purple.
         return {
-            "info": QColor("#d4d4d4"),
-            "system": QColor("#7ec8e3"),
-            "muted": QColor("#7a7a7a"),
-            "error": QColor("#ff6b6b"),
-            "warn": QColor("#f0c674"),
-            "answer": QColor("#00ff9c"),
-            "prompt": QColor("#c5c8c6"),
-        }.get(style, QColor("#d4d4d4"))
+            "info": QColor("#e8dfff"),
+            "system": QColor("#b9a0ff"),
+            "muted": QColor("#a99dc4"),
+            "error": QColor("#ff6b9d"),
+            "warn": QColor("#ffb74d"),
+            "answer": QColor("#9eff8c"),
+            "prompt": QColor("#c09bff"),
+        }.get(style, QColor("#e8dfff"))
 
     def _append_styled(self, text: str, style: str = "info") -> None:
         cursor = self.output.textCursor()
